@@ -1,0 +1,1045 @@
+#!/usr/bin/env python3
+"""
+GitHub 一键上传工具 (Python GUI 版)
+支持默认工作流模板、自定义 YML 和 ZIP 上传。
+所有模板内嵌，无需外部文件。
+"""
+
+import os
+import sys
+import json
+import base64
+import threading
+import re
+from datetime import datetime
+from tkinter import *
+from tkinter import ttk, filedialog, messagebox
+from typing import Optional, List, Dict, Any, Tuple
+
+import requests
+
+# ==================== 配置文件 ====================
+CONFIG_FILE = os.path.expanduser("~/.github_uploader_config.json")
+
+def load_config() -> Dict[str, Any]:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_config(config: Dict[str, Any]):
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
+
+# ==================== GitHub API 封装 ====================
+class GitHubAPI:
+    BASE_URL = "https://api.github.com"
+
+    def __init__(self, token: str):
+        self.token = token.strip()
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"token {self.token}",
+            "Accept": "application/vnd.github.v3+json"
+        })
+
+    def _handle_response(self, response: requests.Response, success_codes=(200, 201, 204)):
+        if response.status_code in success_codes:
+            return response
+        else:
+            try:
+                error_msg = response.json().get("message", response.text)
+            except:
+                error_msg = response.text
+            raise Exception(f"GitHub API 错误 {response.status_code}: {error_msg}")
+
+    def get_authenticated_user(self) -> Dict[str, Any]:
+        resp = self.session.get(f"{self.BASE_URL}/user")
+        self._handle_response(resp)
+        return resp.json()
+
+    def list_user_repos(self, per_page=100, sort="updated") -> List[Dict[str, Any]]:
+        resp = self.session.get(f"{self.BASE_URL}/user/repos", params={"per_page": per_page, "sort": sort})
+        self._handle_response(resp)
+        return resp.json()
+
+    def get_repo_contents(self, owner: str, repo: str, path: str = "", branch: str = "main") -> List[Dict[str, Any]]:
+        url = f"{self.BASE_URL}/repos/{owner}/{repo}/contents/{path}"
+        resp = self.session.get(url, params={"ref": branch})
+        self._handle_response(resp)
+        return resp.json()
+
+    def get_file_sha(self, owner: str, repo: str, path: str, branch: str = "main") -> Optional[str]:
+        url = f"{self.BASE_URL}/repos/{owner}/{repo}/contents/{path}"
+        resp = self.session.get(url, params={"ref": branch})
+        if resp.status_code == 200:
+            return resp.json().get("sha")
+        elif resp.status_code == 404:
+            return None
+        else:
+            self._handle_response(resp)
+
+    def create_or_update_file(self, owner: str, repo: str, path: str, content_base64: str,
+                              message: str, branch: str = "main", sha: Optional[str] = None) -> Dict[str, Any]:
+        url = f"{self.BASE_URL}/repos/{owner}/{repo}/contents/{path}"
+        payload = {
+            "message": message,
+            "content": content_base64,
+            "branch": branch
+        }
+        if sha:
+            payload["sha"] = sha
+        resp = self.session.put(url, json=payload)
+        self._handle_response(resp, success_codes=(200, 201))
+        return resp.json()
+
+    def create_repository(self, name: str, description: str = "", private: bool = True, auto_init: bool = False) -> Dict[str, Any]:
+        url = f"{self.BASE_URL}/user/repos"
+        payload = {
+            "name": name,
+            "description": description,
+            "private": private,
+            "auto_init": auto_init
+        }
+        resp = self.session.post(url, json=payload)
+        self._handle_response(resp, success_codes=(201,))
+        return resp.json()
+
+# ==================== 内嵌模板内容 ====================
+UNPACK_YML_TEMPLATE = """\
+name: Unpack ZIP and Move Subdir to Root
+
+on:
+  push:
+    paths: ['**.zip']
+  workflow_dispatch:
+    inputs:
+      zip_file:
+        description: '要解压的 ZIP 文件名（例如 "archive.zip"）'
+        required: false
+        default: ''
+      subdir:
+        description: '要移动到根目录的子目录名（可选，独立于 ZIP）'
+        required: false
+        default: ''
+
+jobs:
+  unpack-and-move:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 自动解压并移动子目录内容
+        if: github.event_name == 'push'
+        run: |
+          shopt -s dotglob
+          zip_files=(*.zip)
+          count=${#zip_files[@]}
+
+          if [ $count -eq 0 ]; then
+            echo "没有找到 ZIP 文件"
+            exit 0
+          elif [ $count -eq 1 ]; then
+            zipfile="${zip_files[0]}"
+            echo "自动解压: $zipfile"
+            temp_dir="${zipfile%.zip}_temp_$$"
+            mkdir -p "$temp_dir"
+            unzip -o "$zipfile" -d "$temp_dir"
+
+            if [ -z "$(ls -A "$temp_dir")" ]; then
+              echo "⚠️ ZIP 文件为空"
+              rm -rf "$temp_dir"
+              rm -f "$zipfile"
+              exit 0
+            fi
+
+            items=("$temp_dir"/*)
+            if [ ${#items[@]} -eq 1 ] && [ -d "${items[0]}" ]; then
+              subdir="${items[0]}"
+              echo "检测到单一顶层子目录: $subdir，将其内容移动到根目录"
+              cp -rf "$subdir"/. .
+              rm -rf "$subdir"
+            else
+              echo "ZIP 内没有单一顶层目录，直接移动所有内容"
+              cp -rf "$temp_dir"/. .
+            fi
+
+            rm -rf "$temp_dir"
+            rm -f "$zipfile"
+            echo "✅ 解压并移动完成"
+          else
+            echo "检测到多个 ZIP 文件 ($count 个)，不自动解压。"
+            echo "请手动运行 workflow_dispatch 并指定 zip_file。"
+            for f in "${zip_files[@]}"; do
+              echo "  - $f"
+            done
+            exit 0
+          fi
+
+      - name: 手动解压并移动子目录内容
+        if: github.event_name == 'workflow_dispatch' && inputs.zip_file != ''
+        run: |
+          shopt -s dotglob
+          zipfile="${{ inputs.zip_file }}"
+          if [ ! -f "$zipfile" ]; then
+            echo "❌ 文件 '$zipfile' 不存在"
+            ls -1 *.zip 2>/dev/null || echo "（当前目录无 zip 文件）"
+            exit 1
+          fi
+          echo "手动解压: $zipfile"
+          temp_dir="${zipfile%.zip}_temp_$$"
+          mkdir -p "$temp_dir"
+          unzip -o "$zipfile" -d "$temp_dir"
+
+          items=("$temp_dir"/*)
+          if [ ${#items[@]} -eq 1 ] && [ -d "${items[0]}" ]; then
+            subdir="${items[0]}"
+            echo "检测到单一顶层子目录: $subdir，将其内容移动到根目录"
+            cp -rf "$subdir"/. .
+            rm -rf "$subdir"
+          else
+            echo "ZIP 内没有单一顶层目录，直接移动所有内容"
+            cp -rf "$temp_dir"/. .
+          fi
+
+          rm -rf "$temp_dir"
+          rm -f "$zipfile"
+          echo "✅ 解压并移动完成"
+
+      - name: 移动指定的子目录到根目录
+        if: github.event_name == 'workflow_dispatch' && inputs.subdir != ''
+        run: |
+          shopt -s dotglob
+          SUBDIR="${{ inputs.subdir }}"
+          if [ -d "$SUBDIR" ]; then
+            echo "移动子目录 '$SUBDIR' 的内容到根目录"
+            cp -rf "$SUBDIR"/. .
+            rm -rf "$SUBDIR"
+            echo "✅ 子目录已提升到根目录"
+          else
+            echo "❌ 子目录 '$SUBDIR' 不存在"
+            exit 1
+          fi
+
+      - name: 提交更改
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add . -- ':!.github'
+          git diff --staged --quiet || git commit -m "解压 ZIP 并整理目录结构"
+          git push
+"""
+
+BUILD_YML_TEMPLATE = """\
+name: Build Android APK
+
+on:
+  push:
+    branches: [ {{BRANCH}} ]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK {{JAVA_VERSION}}
+        id: setup-java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '{{JAVA_VERSION}}'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Set JAVA_HOME
+        run: |
+          {{JAVA_HOME_SETUP}}
+          echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
+
+      - name: Verify Java
+        run: |
+          echo "JAVA_HOME: $JAVA_HOME"
+          java -version
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '{{GRADLE_VERSION}}'
+
+      - name: Build APK
+        run: gradle assemble{{BUILD_TYPE_CAPITALIZED}} --stacktrace --no-daemon
+
+      - name: Find and upload APK
+        id: find_apk
+        run: |
+          APK_PATH=$(find . -name "*.apk" -type f | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "❌ No APK found"
+            find . -path "*/build/outputs/*" -type f | head -20
+            exit 1
+          fi
+          echo "✅ Found APK: $APK_PATH"
+          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-{{BUILD_TYPE}}-apk
+          path: ${{ steps.find_apk.outputs.apk_path }}
+          retention-days: 7
+"""
+
+# ==================== 日志管理器 ====================
+class Logger:
+    def __init__(self, text_widget: Text):
+        self.text_widget = text_widget
+        self.clear()
+
+    def add(self, msg: str, tag: str = None):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {msg}\n"
+        self.text_widget.insert(END, line, tag)
+        self.text_widget.see(END)
+
+    def clear(self):
+        self.text_widget.delete(1.0, END)
+
+# ==================== 自定义 YML 项 ====================
+class CustomYmlItem:
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.filename = os.path.basename(filepath)
+
+# ==================== 主窗口 ====================
+class GitHubUploaderApp:
+    def __init__(self, root: Tk):
+        self.root = root
+        self.root.title("GitHub 一键上传工具")
+        self.root.geometry("950x750")
+        self.root.minsize(850, 650)
+
+        # 加载配置
+        self.config = load_config()
+        self.token = self.config.get('token', '').strip()
+        self.branch = self.config.get('branch', 'main')
+        self.repo_url = self.config.get('repo_url', '')
+        self.create_new = self.config.get('create_new', False)
+        self.new_repo_name = self.config.get('new_repo_name', '')
+        self.new_repo_desc = self.config.get('new_repo_desc', '')
+        self.new_repo_private = self.config.get('new_repo_private', True)
+        self.upload_default_unpack = self.config.get('upload_default_unpack', True)
+        self.upload_default_build = self.config.get('upload_default_build', True)
+
+        # build.yml 相关设置
+        self.build_branch = self.config.get('build_branch', 'main')
+        self.java_version = self.config.get('java_version', '17')
+        self.java_home_custom = self.config.get('java_home_custom', '')
+        self.gradle_version = self.config.get('gradle_version', '8.5')
+        self.build_type = self.config.get('build_type', 'debug')
+
+        # 运行时数据
+        self.api: Optional[GitHubAPI] = None
+        self.user_repos: List[Dict] = []
+        self.selected_repo: Optional[Dict] = None
+        self.custom_yml_files: List[CustomYmlItem] = []
+        self.zip_filepath: Optional[str] = None
+        self.zip_filename: str = ""
+        self.is_uploading = False
+
+        # 创建界面
+        self.setup_ui()
+
+        # 如果有 token，自动初始化 API
+        if self.token:
+            self.api = GitHubAPI(self.token)
+            self.update_user_info()
+            self.load_repo_list_async()
+
+    # ---------- UI 构建 ----------
+    def setup_ui(self):
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=BOTH, expand=True)
+
+        # ---- 顶部认证栏 ----
+        top_frame = ttk.LabelFrame(main_frame, text="GitHub 认证", padding="5")
+        top_frame.pack(fill=X, pady=(0, 10))
+
+        ttk.Label(top_frame, text="Token:").grid(row=0, column=0, sticky=W, padx=5)
+        self.token_var = StringVar(value=self.token)
+        self.token_entry = ttk.Entry(top_frame, textvariable=self.token_var, width=50, show="*")
+        self.token_entry.grid(row=0, column=1, sticky=EW, padx=5)
+        self.show_token_var = BooleanVar(value=False)
+        ttk.Checkbutton(top_frame, text="显示", variable=self.show_token_var, command=self.toggle_token_visibility).grid(row=0, column=2, padx=5)
+        ttk.Button(top_frame, text="应用 Token", command=self.apply_token).grid(row=0, column=3, padx=5)
+        top_frame.columnconfigure(1, weight=1)
+
+        # ---- 仓库设置 ----
+        repo_frame = ttk.LabelFrame(main_frame, text="仓库设置", padding="5")
+        repo_frame.pack(fill=X, pady=(0, 10))
+
+        self.repo_mode_var = StringVar(value="new" if self.create_new else "existing")
+        ttk.Radiobutton(repo_frame, text="使用现有仓库", variable=self.repo_mode_var, value="existing", command=self.on_repo_mode_change).grid(row=0, column=0, padx=5)
+        ttk.Radiobutton(repo_frame, text="创建新仓库", variable=self.repo_mode_var, value="new", command=self.on_repo_mode_change).grid(row=0, column=1, padx=5)
+
+        # 现有仓库面板
+        self.existing_frame = ttk.Frame(repo_frame)
+        self.existing_frame.grid(row=1, column=0, columnspan=2, sticky=EW, pady=5)
+
+        ttk.Label(self.existing_frame, text="仓库地址:").grid(row=0, column=0, padx=5, sticky=W)
+        self.repo_url_var = StringVar(value=self.repo_url)
+        self.repo_url_entry = ttk.Entry(self.existing_frame, textvariable=self.repo_url_var, width=40)
+        self.repo_url_entry.grid(row=0, column=1, padx=5, sticky=EW)
+        self.repo_url_var.trace_add("write", lambda *args: self.save_config_later())
+
+        ttk.Label(self.existing_frame, text="快速选择:").grid(row=1, column=0, padx=5, sticky=W)
+        self.quick_search_var = StringVar()
+        self.quick_combo = ttk.Combobox(self.existing_frame, textvariable=self.quick_search_var, width=40)
+        self.quick_combo.grid(row=1, column=1, padx=5, sticky=EW)
+        self.quick_combo.bind('<KeyRelease>', self.on_quick_search)
+        self.quick_combo.bind('<<ComboboxSelected>>', self.on_quick_selected)
+        ttk.Button(self.existing_frame, text="刷新", command=self.load_repo_list_async).grid(row=1, column=2, padx=5)
+        self.existing_frame.columnconfigure(1, weight=1)
+
+        # 新建仓库面板
+        self.new_frame = ttk.Frame(repo_frame)
+        self.new_frame.grid(row=1, column=0, columnspan=2, sticky=EW, pady=5)
+
+        ttk.Label(self.new_frame, text="仓库名称:").grid(row=0, column=0, padx=5, sticky=W)
+        self.new_name_var = StringVar(value=self.new_repo_name)
+        ttk.Entry(self.new_frame, textvariable=self.new_name_var, width=30).grid(row=0, column=1, padx=5, sticky=EW)
+        ttk.Label(self.new_frame, text="描述(可选):").grid(row=0, column=2, padx=5, sticky=W)
+        self.new_desc_var = StringVar(value=self.new_repo_desc)
+        ttk.Entry(self.new_frame, textvariable=self.new_desc_var, width=30).grid(row=0, column=3, padx=5, sticky=EW)
+        self.private_var = BooleanVar(value=self.new_repo_private)
+        ttk.Checkbutton(self.new_frame, text="私有仓库", variable=self.private_var).grid(row=0, column=4, padx=5)
+        self.new_frame.columnconfigure(1, weight=1)
+        self.new_frame.columnconfigure(3, weight=1)
+
+        self.on_repo_mode_change()
+
+        # ---- 文件选择区域 (紧凑) ----
+        file_frame = ttk.LabelFrame(main_frame, text="文件选择", padding="5")
+        file_frame.pack(fill=X, pady=(0, 10))
+
+        btn_frame = ttk.Frame(file_frame)
+        btn_frame.pack(fill=X, pady=5)
+        ttk.Button(btn_frame, text="选择文件", command=self.select_file).pack(side=LEFT, padx=5)
+        ttk.Button(btn_frame, text="清空列表", command=self.clear_files).pack(side=LEFT, padx=5)
+
+        yml_frame = ttk.LabelFrame(file_frame, text="自定义 YML 文件")
+        yml_frame.pack(fill=X, pady=(0, 5))
+        yml_scroll = ttk.Scrollbar(yml_frame)
+        yml_scroll.pack(side=RIGHT, fill=Y)
+        self.yml_tree = ttk.Treeview(yml_frame, columns=("path",), show="tree headings",
+                                     yscrollcommand=yml_scroll.set, height=3)
+        yml_scroll.config(command=self.yml_tree.yview)
+        self.yml_tree.heading("#0", text="文件名")
+        self.yml_tree.heading("path", text="完整路径")
+        self.yml_tree.column("#0", width=200)
+        self.yml_tree.column("path", width=400)
+        self.yml_tree.pack(fill=X)
+        self.yml_tree.bind("<Delete>", lambda e: self.remove_selected_yml())
+        self.yml_tree.bind("<Button-3>", self.show_yml_context_menu)
+
+        zip_frame = ttk.LabelFrame(file_frame, text="ZIP 文件")
+        zip_frame.pack(fill=X)
+        self.zip_label_var = StringVar(value="未选择 ZIP 文件")
+        ttk.Label(zip_frame, textvariable=self.zip_label_var).pack(side=LEFT, padx=5, pady=5)
+        ttk.Button(zip_frame, text="移除", command=self.remove_zip).pack(side=RIGHT, padx=5, pady=5)
+
+        # ---- 上传按钮 ----
+        self.upload_btn = ttk.Button(main_frame, text="开始上传", command=self.start_upload, style="Accent.TButton")
+        self.upload_btn.pack(fill=X, pady=5)
+
+        # ---- 信息标签页 ----
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=BOTH, expand=True)
+
+        # 日志
+        log_frame = ttk.Frame(self.notebook)
+        self.notebook.add(log_frame, text="操作日志")
+        log_toolbar = ttk.Frame(log_frame)
+        log_toolbar.pack(fill=X)
+        ttk.Button(log_toolbar, text="清除日志", command=self.clear_log).pack(side=LEFT, padx=5)
+        self.log_text = Text(log_frame, wrap=WORD, font=("Consolas", 10))
+        log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.config(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side=RIGHT, fill=Y)
+        self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
+        self.logger = Logger(self.log_text)
+
+        # 信息
+        info_frame = ttk.Frame(self.notebook)
+        self.notebook.add(info_frame, text="登录信息")
+        self.user_info_text = Text(info_frame, wrap=WORD, height=10, state=DISABLED)
+        self.user_info_text.pack(fill=BOTH, expand=True, padx=5, pady=5)
+
+        # 仓库内容
+        content_frame = ttk.Frame(self.notebook)
+        self.notebook.add(content_frame, text="仓库代码")
+        self.content_tree = ttk.Treeview(content_frame, columns=("type", "size"), show="tree headings")
+        self.content_tree.heading("#0", text="名称")
+        self.content_tree.heading("type", text="类型")
+        self.content_tree.heading("size", text="大小")
+        self.content_tree.column("#0", width=300)
+        self.content_tree.column("type", width=80)
+        self.content_tree.column("size", width=100)
+        content_scroll = ttk.Scrollbar(content_frame, command=self.content_tree.yview)
+        self.content_tree.config(yscrollcommand=content_scroll.set)
+        content_scroll.pack(side=RIGHT, fill=Y)
+        self.content_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        ttk.Button(content_frame, text="刷新", command=self.load_repo_contents_async).pack(pady=5)
+
+        # 状态栏
+        self.status_var = StringVar(value="就绪")
+        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=SUNKEN, anchor=W)
+        status_bar.pack(fill=X, pady=(5, 0))
+
+        # 菜单
+        menubar = Menu(self.root)
+        self.root.config(menu=menubar)
+        settings_menu = Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="设置", menu=settings_menu)
+        settings_menu.add_command(label="首选项", command=self.open_settings_dialog)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ---------- UI 交互 ----------
+    def toggle_token_visibility(self):
+        self.token_entry.config(show="" if self.show_token_var.get() else "*")
+
+    def apply_token(self):
+        token = self.token_var.get().strip()
+        if not token:
+            messagebox.showerror("错误", "Token 不能为空")
+            return
+        self.token = token
+        self.config['token'] = token
+        save_config(self.config)
+        self.api = GitHubAPI(token)
+        self.update_user_info()
+        self.load_repo_list_async()
+        self.logger.add("Token 已应用，正在验证...")
+
+    def update_user_info(self):
+        if not self.api:
+            return
+        def task():
+            try:
+                user = self.api.get_authenticated_user()
+                self.root.after(0, lambda: self._display_user_info(user))
+                self.logger.add(f"✅ 登录成功，用户: {user['login']}")
+            except Exception as e:
+                self.logger.add(f"❌ Token 验证失败: {e}")
+        threading.Thread(target=task, daemon=True).start()
+
+    def _display_user_info(self, user):
+        self.user_info_text.config(state=NORMAL)
+        self.user_info_text.delete(1.0, END)
+        info = f"用户名: {user['login']}\n"
+        info += f"姓名: {user.get('name', '未设置')}\n"
+        info += f"邮箱: {user.get('email', '未公开')}\n"
+        info += f"头像: {user.get('avatar_url', '')}\n"
+        info += "\n--- 仓库信息 ---\n"
+        if self.create_new:
+            info += f"新仓库: {self.new_name_var.get()}\n"
+        elif self.repo_url_var.get():
+            parsed = self.parse_repo_url(self.repo_url_var.get())
+            if parsed:
+                info += f"仓库: {parsed[0]}/{parsed[1]}\n分支: {self.branch}\n"
+            else:
+                info += "仓库地址格式错误\n"
+        else:
+            info += "未选择仓库\n"
+        self.user_info_text.insert(END, info)
+        self.user_info_text.config(state=DISABLED)
+
+    def load_repo_list_async(self):
+        if not self.api:
+            return
+        self.status_var.set("正在加载仓库列表...")
+        def task():
+            try:
+                repos = self.api.list_user_repos()
+                self.user_repos = repos
+                self.root.after(0, self._populate_quick_combo)
+                self.logger.add(f"已加载 {len(repos)} 个仓库")
+            except Exception as e:
+                self.logger.add(f"加载仓库列表失败: {e}")
+            finally:
+                self.root.after(0, lambda: self.status_var.set("就绪"))
+        threading.Thread(target=task, daemon=True).start()
+
+    def _populate_quick_combo(self):
+        values = [repo['full_name'] for repo in self.user_repos]
+        self.quick_combo['values'] = values
+
+    def on_quick_search(self, event=None):
+        search = self.quick_search_var.get().lower()
+        filtered = [repo['full_name'] for repo in self.user_repos if search in repo['full_name'].lower()]
+        self.quick_combo['values'] = filtered
+
+    def on_quick_selected(self, event=None):
+        fullname = self.quick_search_var.get()
+        for repo in self.user_repos:
+            if repo['full_name'] == fullname:
+                self.selected_repo = repo
+                self.repo_url_var.set(repo['html_url'])
+                self.save_config_later()
+                self.quick_search_var.set("")
+                self.logger.add(f"已选择仓库: {fullname}")
+                break
+
+    def parse_repo_url(self, url: str) -> Optional[Tuple[str, str]]:
+        patterns = [
+            re.compile(r"github\.com[:/]([^/]+)/([^/.]+)"),
+            re.compile(r"https?://github\.com/([^/]+)/([^/.]+)")
+        ]
+        for p in patterns:
+            m = p.search(url)
+            if m:
+                return m.group(1), m.group(2)
+        return None
+
+    def on_repo_mode_change(self):
+        mode = self.repo_mode_var.get()
+        self.create_new = (mode == "new")
+        self.config['create_new'] = self.create_new
+        save_config(self.config)
+        if self.create_new:
+            self.existing_frame.grid_remove()
+            self.new_frame.grid()
+        else:
+            self.new_frame.grid_remove()
+            self.existing_frame.grid()
+        self.update_user_info()
+
+    def select_file(self):
+        filepath = filedialog.askopenfilename(
+            title="选择文件",
+            filetypes=[("支持的文件", "*.yml *.yaml *.zip"), ("所有文件", "*.*")]
+        )
+        if not filepath:
+            return
+        filename = os.path.basename(filepath)
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in ('.yml', '.yaml'):
+            item = CustomYmlItem(filepath)
+            self.custom_yml_files.append(item)
+            self.yml_tree.insert("", END, text=item.filename, values=(item.filepath,), iid=filepath)
+            self.logger.add(f"➕ 添加 YML: {filename}")
+        elif ext == '.zip':
+            if self.zip_filepath:
+                self.logger.add(f"📁 替换 ZIP: {self.zip_filename} -> {filename}")
+            else:
+                self.logger.add(f"📁 选择 ZIP: {filename}")
+            self.zip_filepath = filepath
+            self.zip_filename = filename
+            self.zip_label_var.set(f"ZIP: {filename}")
+        else:
+            messagebox.showwarning("不支持的文件类型", f"文件 {filename} 不是 .yml/.yaml 或 .zip，已忽略")
+
+    def clear_files(self):
+        self.custom_yml_files.clear()
+        for item in self.yml_tree.get_children():
+            self.yml_tree.delete(item)
+        self.zip_filepath = None
+        self.zip_filename = ""
+        self.zip_label_var.set("未选择 ZIP 文件")
+        self.logger.add("已清空文件列表")
+
+    def remove_selected_yml(self):
+        selected = self.yml_tree.selection()
+        for iid in selected:
+            self.yml_tree.delete(iid)
+            self.custom_yml_files = [f for f in self.custom_yml_files if f.filepath != iid]
+            self.logger.add(f"🗑 移除 YML: {os.path.basename(iid)}")
+
+    def show_yml_context_menu(self, event):
+        iid = self.yml_tree.identify_row(event.y)
+        if iid:
+            self.yml_tree.selection_set(iid)
+            menu = Menu(self.root, tearoff=0)
+            menu.add_command(label="移除", command=self.remove_selected_yml)
+            menu.post(event.x_root, event.y_root)
+
+    def remove_zip(self):
+        if self.zip_filepath:
+            self.logger.add(f"🗑 移除 ZIP: {self.zip_filename}")
+            self.zip_filepath = None
+            self.zip_filename = ""
+            self.zip_label_var.set("未选择 ZIP 文件")
+
+    def clear_log(self):
+        self.logger.clear()
+
+    def load_repo_contents_async(self):
+        if not self.api:
+            messagebox.showwarning("提示", "请先配置 Token")
+            return
+        if self.create_new:
+            messagebox.showinfo("提示", "新仓库尚未创建，无法查看内容")
+            return
+        url = self.repo_url_var.get().strip()
+        if not url:
+            messagebox.showwarning("提示", "请输入仓库地址")
+            return
+        parsed = self.parse_repo_url(url)
+        if not parsed:
+            messagebox.showwarning("提示", "仓库地址格式错误")
+            return
+        owner, repo = parsed
+        branch = self.branch
+
+        self.status_var.set("正在加载仓库内容...")
+        def task():
+            try:
+                contents = self.api.get_repo_contents(owner, repo, "", branch)
+                self.root.after(0, lambda: self._display_repo_contents(contents))
+            except Exception as e:
+                self.logger.add(f"加载仓库内容失败: {e}")
+            finally:
+                self.root.after(0, lambda: self.status_var.set("就绪"))
+        threading.Thread(target=task, daemon=True).start()
+
+    def _display_repo_contents(self, contents):
+        for item in self.content_tree.get_children():
+            self.content_tree.delete(item)
+        for item in contents:
+            type_str = "目录" if item['type'] == 'dir' else "文件"
+            size = item.get('size', '')
+            self.content_tree.insert("", END, text=item['name'], values=(type_str, size))
+
+    def generate_build_yml(self) -> str:
+        template = BUILD_YML_TEMPLATE
+        branch = self.build_branch
+        if self.java_home_custom.strip():
+            java_home_setup = f'export JAVA_HOME="{self.java_home_custom.strip()}"'
+        else:
+            java_home_setup = 'echo "JAVA_HOME=${{ steps.setup-java.outputs.path }}" >> $GITHUB_ENV'
+        build_type_cap = self.build_type.capitalize()
+        replacements = {
+            '{{BRANCH}}': branch,
+            '{{JAVA_VERSION}}': self.java_version,
+            '{{JAVA_HOME_SETUP}}': java_home_setup,
+            '{{GRADLE_VERSION}}': self.gradle_version,
+            '{{BUILD_TYPE}}': self.build_type,
+            '{{BUILD_TYPE_CAPITALIZED}}': build_type_cap,
+        }
+        for key, val in replacements.items():
+            template = template.replace(key, val)
+        return template
+
+    def start_upload(self):
+        if self.is_uploading:
+            return
+        if not self.api:
+            messagebox.showerror("错误", "请先配置并应用 Token")
+            return
+        if self.create_new:
+            name = self.new_name_var.get().strip()
+            if not name:
+                messagebox.showerror("错误", "请输入新仓库名称")
+                return
+        else:
+            url = self.repo_url_var.get().strip()
+            if not url:
+                messagebox.showerror("错误", "请输入仓库地址")
+                return
+            if not self.parse_repo_url(url):
+                messagebox.showerror("错误", "仓库地址格式错误")
+                return
+
+        msg = "即将上传：\n"
+        if self.upload_default_unpack:
+            msg += "  - unpack.yml (默认)\n"
+        if self.upload_default_build:
+            msg += "  - build.yml (默认)\n"
+        msg += f"自定义 YML: {len(self.custom_yml_files)} 个\n"
+        msg += f"ZIP: {'是' if self.zip_filepath else '否'}\n"
+        if not messagebox.askyesno("确认上传", msg + "是否继续？"):
+            return
+
+        self.is_uploading = True
+        self.upload_btn.config(state=DISABLED, text="上传中...")
+        self.status_var.set("正在上传...")
+        self.logger.add("🚀 开始上传...")
+
+        def upload_task():
+            try:
+                token = self.token
+                if self.create_new:
+                    self.logger.add(f"📦 创建仓库: {self.new_name_var.get()}")
+                    repo = self.api.create_repository(
+                        name=self.new_name_var.get(),
+                        description=self.new_desc_var.get(),
+                        private=self.private_var.get()
+                    )
+                    owner = repo['owner']['login']
+                    repo_name = repo['name']
+                    target_branch = repo.get('default_branch', 'main')
+                    self.repo_url_var.set(repo['html_url'])
+                    self.save_config_later()
+                    self.logger.add(f"✅ 仓库创建成功: {repo['html_url']}")
+                else:
+                    owner, repo_name = self.parse_repo_url(self.repo_url_var.get())
+                    target_branch = self.branch
+                    self.logger.add(f"📦 仓库: {owner}/{repo_name}")
+
+                self.logger.add(f"🌿 分支: {target_branch}")
+
+                if self.upload_default_unpack:
+                    self.logger.add("📤 上传 unpack.yml ...")
+                    self.upload_yml_content(owner, repo_name, "unpack.yml", UNPACK_YML_TEMPLATE, token, target_branch)
+
+                if self.upload_default_build:
+                    self.logger.add("📤 上传 build.yml ...")
+                    build_content = self.generate_build_yml()
+                    self.upload_yml_content(owner, repo_name, "build.yml", build_content, token, target_branch)
+
+                for item in self.custom_yml_files:
+                    self.logger.add(f"📤 上传自定义 YML: {item.filename} ...")
+                    try:
+                        with open(item.filepath, 'rb') as f:
+                            content_b64 = base64.b64encode(f.read()).decode('utf-8')
+                        self.upload_file(owner, repo_name, f".github/workflows/{item.filename}", content_b64, token, target_branch)
+                        self.logger.add(f"✅ {item.filename} 上传成功")
+                    except Exception as e:
+                        self.logger.add(f"❌ {item.filename} 上传失败: {e}")
+
+                if self.zip_filepath:
+                    self.logger.add(f"📤 上传 ZIP: {self.zip_filename} ...")
+                    try:
+                        with open(self.zip_filepath, 'rb') as f:
+                            content_b64 = base64.b64encode(f.read()).decode('utf-8')
+                        self.upload_file(owner, repo_name, self.zip_filename, content_b64, token, target_branch)
+                        self.logger.add(f"✅ {self.zip_filename} 上传成功")
+                    except Exception as e:
+                        self.logger.add(f"❌ ZIP 上传失败: {e}")
+                else:
+                    self.logger.add("📂 无 ZIP 文件")
+
+                self.logger.add("✅ 所有操作完成！")
+                self.root.after(0, self.load_repo_contents_async)
+
+            except Exception as e:
+                self.logger.add(f"❌ 错误: {e}")
+            finally:
+                self.root.after(0, self._upload_finished)
+
+        threading.Thread(target=upload_task, daemon=True).start()
+
+    def upload_yml_content(self, owner, repo, filename, content, token, branch):
+        content_b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+        self.upload_file(owner, repo, f".github/workflows/{filename}", content_b64, token, branch)
+        self.logger.add(f"✅ {filename} 上传成功")
+
+    def upload_file(self, owner, repo, path, content_b64, token, branch):
+        sha = self.api.get_file_sha(owner, repo, path, branch)
+        self.api.create_or_update_file(owner, repo, path, content_b64, f"Upload {path}", branch, sha)
+
+    def _upload_finished(self):
+        self.is_uploading = False
+        self.upload_btn.config(state=NORMAL, text="开始上传")
+        self.status_var.set("就绪")
+
+    def save_config_later(self):
+        self.config['repo_url'] = self.repo_url_var.get()
+        self.config['create_new'] = self.create_new
+        self.config['new_repo_name'] = self.new_name_var.get()
+        self.config['new_repo_desc'] = self.new_desc_var.get()
+        self.config['new_repo_private'] = self.private_var.get()
+        save_config(self.config)
+
+    # ---------- 设置对话框 ----------
+    def open_settings_dialog(self):
+        dialog = Toplevel(self.root)
+        dialog.title("设置")
+        dialog.geometry("550x550")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding="10")
+        frame.pack(fill=BOTH, expand=True)
+
+        row = 0
+        ttk.Label(frame, text="GitHub Token:").grid(row=row, column=0, sticky=W, pady=5)
+        token_var = StringVar(value=self.token)
+        token_entry = ttk.Entry(frame, textvariable=token_var, width=40, show="*")
+        token_entry.grid(row=row, column=1, sticky=EW, pady=5)
+        row += 1
+
+        ttk.Label(frame, text="目标分支:").grid(row=row, column=0, sticky=W, pady=5)
+        branch_var = StringVar(value=self.branch)
+        ttk.Entry(frame, textvariable=branch_var, width=20).grid(row=row, column=1, sticky=W, pady=5)
+        row += 1
+
+        ttk.Separator(frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky=EW, pady=10)
+        row += 1
+
+        ttk.Label(frame, text="默认 Workflow", font=('', 10, 'bold')).grid(row=row, column=0, columnspan=2, sticky=W)
+        row += 1
+        unpack_var = BooleanVar(value=self.upload_default_unpack)
+        ttk.Checkbutton(frame, text="上传 unpack.yml (解压ZIP)", variable=unpack_var).grid(row=row, column=0, columnspan=2, sticky=W)
+        row += 1
+        build_var = BooleanVar(value=self.upload_default_build)
+        ttk.Checkbutton(frame, text="上传 build.yml (构建APK)", variable=build_var).grid(row=row, column=0, columnspan=2, sticky=W)
+        row += 1
+
+        ttk.Separator(frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky=EW, pady=10)
+        row += 1
+
+        ttk.Label(frame, text="build.yml 配置", font=('', 10, 'bold')).grid(row=row, column=0, columnspan=2, sticky=W)
+        row += 1
+
+        ttk.Label(frame, text="触发分支:").grid(row=row, column=0, sticky=W, pady=5)
+        branch_frame = ttk.Frame(frame)
+        branch_frame.grid(row=row, column=1, sticky=W, pady=5)
+        build_branch_var = StringVar(value=self.build_branch)
+        ttk.Radiobutton(branch_frame, text="main", variable=build_branch_var, value="main").pack(side=LEFT, padx=2)
+        ttk.Radiobutton(branch_frame, text="master", variable=build_branch_var, value="master").pack(side=LEFT, padx=2)
+        ttk.Radiobutton(branch_frame, text="自定义:", variable=build_branch_var, value="custom").pack(side=LEFT, padx=2)
+        custom_branch_var = StringVar(value=self.build_branch if self.build_branch not in ('main', 'master') else '')
+        custom_branch_entry = ttk.Entry(branch_frame, textvariable=custom_branch_var, width=10, state='readonly' if build_branch_var.get() != 'custom' else 'normal')
+        custom_branch_entry.pack(side=LEFT, padx=2)
+        def on_branch_change(*args):
+            if build_branch_var.get() == 'custom':
+                custom_branch_entry.config(state='normal')
+            else:
+                custom_branch_entry.config(state='readonly')
+        build_branch_var.trace_add('write', on_branch_change)
+        row += 1
+
+        ttk.Label(frame, text="Java 版本:").grid(row=row, column=0, sticky=W, pady=5)
+        java_var = StringVar(value=self.java_version)
+        ttk.Entry(frame, textvariable=java_var, width=10).grid(row=row, column=1, sticky=W, pady=5)
+        row += 1
+
+        ttk.Label(frame, text="JAVA_HOME 路径 (留空自动):").grid(row=row, column=0, sticky=W, pady=5)
+        java_home_var = StringVar(value=self.java_home_custom)
+        ttk.Entry(frame, textvariable=java_home_var, width=30).grid(row=row, column=1, sticky=EW, pady=5)
+        row += 1
+
+        ttk.Label(frame, text="Gradle 版本:").grid(row=row, column=0, sticky=W, pady=5)
+        gradle_var = StringVar(value=self.gradle_version)
+        ttk.Entry(frame, textvariable=gradle_var, width=10).grid(row=row, column=1, sticky=W, pady=5)
+        row += 1
+
+        ttk.Label(frame, text="构建类型:").grid(row=row, column=0, sticky=W, pady=5)
+        type_frame = ttk.Frame(frame)
+        type_frame.grid(row=row, column=1, sticky=W, pady=5)
+        build_type_var = StringVar(value=self.build_type)
+        ttk.Radiobutton(type_frame, text="Debug", variable=build_type_var, value="debug").pack(side=LEFT, padx=5)
+        ttk.Radiobutton(type_frame, text="Release", variable=build_type_var, value="release").pack(side=LEFT, padx=5)
+        row += 1
+
+        ttk.Separator(frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky=EW, pady=10)
+        row += 1
+
+        ttk.Label(frame, text="新仓库选项", font=('', 10, 'bold')).grid(row=row, column=0, columnspan=2, sticky=W)
+        row += 1
+        ttk.Label(frame, text="描述 (可选):").grid(row=row, column=0, sticky=W, pady=5)
+        desc_var = StringVar(value=self.new_repo_desc)
+        ttk.Entry(frame, textvariable=desc_var, width=40).grid(row=row, column=1, sticky=EW, pady=5)
+        row += 1
+        private_var = BooleanVar(value=self.new_repo_private)
+        ttk.Checkbutton(frame, text="私有仓库", variable=private_var).grid(row=row, column=0, columnspan=2, sticky=W)
+        row += 1
+
+        frame.columnconfigure(1, weight=1)
+
+        def save_settings():
+            self.token = token_var.get().strip()
+            self.branch = branch_var.get().strip() or "main"
+            self.upload_default_unpack = unpack_var.get()
+            self.upload_default_build = build_var.get()
+
+            branch_choice = build_branch_var.get()
+            if branch_choice == 'custom':
+                self.build_branch = custom_branch_var.get().strip()
+                if not self.build_branch:
+                    messagebox.showwarning("提示", "自定义分支不能为空，将使用 'main'")
+                    self.build_branch = 'main'
+            else:
+                self.build_branch = branch_choice
+
+            self.java_version = java_var.get().strip() or "17"
+            self.java_home_custom = java_home_var.get().strip()
+            self.gradle_version = gradle_var.get().strip() or "8.5"
+            self.build_type = build_type_var.get()
+
+            self.new_repo_desc = desc_var.get().strip()
+            self.new_repo_private = private_var.get()
+
+            self.token_var.set(self.token)
+            self.new_desc_var.set(self.new_repo_desc)
+            self.private_var.set(self.new_repo_private)
+
+            self.config.update({
+                'token': self.token,
+                'branch': self.branch,
+                'upload_default_unpack': self.upload_default_unpack,
+                'upload_default_build': self.upload_default_build,
+                'build_branch': self.build_branch,
+                'java_version': self.java_version,
+                'java_home_custom': self.java_home_custom,
+                'gradle_version': self.gradle_version,
+                'build_type': self.build_type,
+                'new_repo_desc': self.new_repo_desc,
+                'new_repo_private': self.new_repo_private,
+            })
+            save_config(self.config)
+
+            if self.token and not self.api:
+                self.api = GitHubAPI(self.token)
+                self.update_user_info()
+                self.load_repo_list_async()
+            elif self.token and self.api and self.api.token != self.token:
+                self.api = GitHubAPI(self.token)
+                self.update_user_info()
+                self.load_repo_list_async()
+
+            self.logger.add("设置已保存")
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="保存", command=save_settings).pack(side=LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=LEFT, padx=5)
+
+    def on_close(self):
+        self.config['token'] = self.token
+        self.config['branch'] = self.branch
+        self.config['repo_url'] = self.repo_url_var.get()
+        self.config['create_new'] = self.create_new
+        self.config['new_repo_name'] = self.new_name_var.get()
+        self.config['new_repo_desc'] = self.new_desc_var.get()
+        self.config['new_repo_private'] = self.private_var.get()
+        self.config['upload_default_unpack'] = self.upload_default_unpack
+        self.config['upload_default_build'] = self.upload_default_build
+        self.config['build_branch'] = self.build_branch
+        self.config['java_version'] = self.java_version
+        self.config['java_home_custom'] = self.java_home_custom
+        self.config['gradle_version'] = self.gradle_version
+        self.config['build_type'] = self.build_type
+        save_config(self.config)
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = Tk()
+    style = ttk.Style()
+    style.theme_use('clam')
+    style.configure("Accent.TButton", font=("", 10, "bold"))
+    app = GitHubUploaderApp(root)
+    root.mainloop()

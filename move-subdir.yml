@@ -1,0 +1,31 @@
+name: Move Subdirectory to Root
+
+on:
+  workflow_dispatch:
+    inputs:
+      subdir:
+        description: '要移动到根目录的子目录名（例如 "dist"）'
+        required: true
+
+jobs:
+  move:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Move subdir content to root
+        run: |
+          if [ ! -d "${{ inputs.subdir }}" ]; then
+            echo "目录不存在"
+            exit 1
+          fi
+          find "${{ inputs.subdir }}" -mindepth 1 -maxdepth 1 -exec mv -t . {} +
+          rm -rf "${{ inputs.subdir }}"
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "Move ${{ inputs.subdir }} to root"
+          git push

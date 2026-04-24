@@ -1,0 +1,146 @@
+name: Unpack ZIP and Build APK
+
+on:
+  push:
+    paths: ['**.zip']
+  workflow_dispatch:
+    inputs:
+      zip_file:
+        description: '要解压的 ZIP 文件名（例如 "archive.zip"）'
+        required: false
+        default: ''
+      subdir:
+        description: '要移动到根目录的子目录名（可选）'
+        required: false
+        default: ''
+
+jobs:
+  unpack-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ========== 1. 解压 ZIP 并移动子目录到根目录 ==========
+      - name: 自动解压（仅当只有一个 ZIP 文件）
+        if: github.event_name == 'push'
+        run: |
+          shopt -s dotglob
+          zip_files=(*.zip)
+          count=${#zip_files[@]}
+
+          if [ $count -eq 0 ]; then
+            echo "没有找到 ZIP 文件"
+            exit 0
+          elif [ $count -eq 1 ]; then
+            zipfile="${zip_files[0]}"
+            echo "自动解压单个 ZIP: $zipfile"
+            temp_dir="${zipfile%.zip}_temp_$$"
+            mkdir -p "$temp_dir"
+            unzip -o "$zipfile" -d "$temp_dir"
+            
+            items=("$temp_dir"/*)
+            if [ ${#items[@]} -eq 1 ] && [ -d "${items[0]}" ]; then
+              subdir="${items[0]}"
+              echo "检测到顶层子目录: $subdir，将其内容移动到根目录"
+              cp -rf "$subdir"/. .
+              rm -rf "$subdir"
+            else
+              echo "ZIP 内没有单一顶层目录，直接移动所有内容"
+              cp -rf "$temp_dir"/. .
+            fi
+            
+            rm -rf "$temp_dir"
+            rm -f "$zipfile"
+            echo "✅ 解压并移动完成"
+          else
+            echo "检测到多个 ZIP 文件 ($count 个)，为避免冲突，不自动解压。"
+            echo "请手动运行 workflow_dispatch，并指定要解压的 ZIP 文件名。"
+            printf '  - %s\n' "${zip_files[@]}"
+            exit 0
+          fi
+
+      - name: 手动解压指定的 ZIP 文件
+        if: github.event_name == 'workflow_dispatch' && inputs.zip_file != ''
+        run: |
+          shopt -s dotglob
+          zipfile="${{ inputs.zip_file }}"
+          if [ ! -f "$zipfile" ]; then
+            echo "错误：文件 '$zipfile' 不存在"
+            ls -1 *.zip 2>/dev/null || echo "（无）"
+            exit 1
+          fi
+          echo "手动解压: $zipfile"
+          temp_dir="${zipfile%.zip}_temp_$$"
+          mkdir -p "$temp_dir"
+          unzip -o "$zipfile" -d "$temp_dir"
+          
+          items=("$temp_dir"/*)
+          if [ ${#items[@]} -eq 1 ] && [ -d "${items[0]}" ]; then
+            subdir="${items[0]}"
+            echo "检测到顶层子目录: $subdir，将其内容移动到根目录"
+            cp -rf "$subdir"/. .
+            rm -rf "$subdir"
+          else
+            echo "ZIP 内没有单一顶层目录，直接移动所有内容"
+            cp -rf "$temp_dir"/. .
+          fi
+          
+          rm -rf "$temp_dir"
+          rm -f "$zipfile"
+          echo "✅ 解压并移动完成"
+
+      - name: 移动手动指定的子目录到根目录（独立于 ZIP）
+        if: github.event_name == 'workflow_dispatch' && inputs.subdir != ''
+        run: |
+          shopt -s dotglob
+          SUBDIR="${{ inputs.subdir }}"
+          if [ -d "$SUBDIR" ]; then
+            echo "移动子目录 '$SUBDIR' 的内容到根目录"
+            cp -rf "$SUBDIR"/. .
+            rm -rf "$SUBDIR"
+            echo "✅ 子目录已提升到根目录"
+          else
+            echo "错误：子目录 '$SUBDIR' 不存在"
+            exit 1
+          fi
+
+      # ========== 2. 提交更改（排除 .github 目录，避免 workflow 权限错误） ==========
+      - name: 提交更改
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add . -- ':!.github'
+          git diff --staged --quiet || git commit -m "自动解压 ZIP 并整理目录结构"
+          git push
+
+      # ========== 3. 构建 Android APK ==========
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Remove hardcoded Java home in gradle.properties
+        run: |
+          if [ -f gradle.properties ]; then
+            sed -i '/org.gradle.java.home/d' gradle.properties
+          fi
+
+      - name: Build APK
+        run: gradle assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7

@@ -1,0 +1,133 @@
+name: Unpack ZIP and Flatten to Root
+
+on:
+  push:
+    paths: ['**.zip']
+  workflow_dispatch:
+    inputs:
+      zip_file:
+        description: '要解压的 ZIP 文件名（例如 "archive.zip"）'
+        required: false
+        default: ''
+      subdir:
+        description: '要移动到根目录的子目录名（可选，仅用于提升现有子目录）'
+        required: false
+        default: ''
+
+jobs:
+  unpack-and-move:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 输入验证：防止将 ZIP 文件名误填到 subdir
+      - name: 验证输入参数
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ -n "${{ inputs.subdir }}" ] && [[ "${{ inputs.subdir }}" == *.zip ]]; then
+            echo "❌ 错误：subdir 参数不能是 ZIP 文件名。"
+            echo "您可能想使用 'zip_file' 参数来解压 ZIP 文件。"
+            echo "请重新运行 workflow，将 ZIP 文件名填入 'zip_file' 字段，清空 'subdir' 字段。"
+            exit 1
+          fi
+          if [ -z "${{ inputs.zip_file }}" ] && [ -z "${{ inputs.subdir }}" ]; then
+            echo "⚠️ 未指定 zip_file 或 subdir，workflow 将不会执行任何操作。"
+            exit 0
+          fi
+
+      - name: 自动解压（仅当只有一个 ZIP 文件且为 push 事件）
+        if: github.event_name == 'push'
+        run: |
+          shopt -s dotglob
+          zip_files=(*.zip)
+          count=${#zip_files[@]}
+
+          if [ $count -eq 0 ]; then
+            echo "没有找到 ZIP 文件"
+            exit 0
+          elif [ $count -eq 1 ]; then
+            zipfile="${zip_files[0]}"
+            echo "自动解压单个 ZIP: $zipfile"
+            temp_dir="${zipfile%.zip}_temp_$$"
+            mkdir -p "$temp_dir"
+            unzip -o "$zipfile" -d "$temp_dir"
+            
+            items=("$temp_dir"/*)
+            if [ ${#items[@]} -eq 1 ] && [ -d "${items[0]}" ]; then
+              subdir="${items[0]}"
+              echo "检测到顶层子目录: $subdir，将其内容移动到根目录"
+              cp -r "$subdir"/. .
+              rm -rf "$subdir"
+            else
+              echo "ZIP 内没有单一顶层目录，直接移动所有内容"
+              cp -r "$temp_dir"/. .
+            fi
+            
+            rm -rf "$temp_dir"
+            rm -f "$zipfile"
+            echo "✅ 解压并移动完成"
+          else
+            echo "检测到多个 ZIP 文件 ($count 个)，为避免冲突，不自动解压。"
+            echo "请手动运行 workflow_dispatch，并指定要解压的 ZIP 文件名。"
+            echo "存在的 ZIP 文件："
+            printf '  - %s\n' "${zip_files[@]}"
+            exit 0
+          fi
+
+      - name: 手动解压指定的 ZIP 文件
+        if: github.event_name == 'workflow_dispatch' && inputs.zip_file != ''
+        run: |
+          shopt -s dotglob
+          zipfile="${{ inputs.zip_file }}"
+          if [ ! -f "$zipfile" ]; then
+            echo "错误：文件 '$zipfile' 不存在"
+            echo "当前目录下的 ZIP 文件："
+            ls -1 *.zip 2>/dev/null || echo "（无）"
+            exit 1
+          fi
+          echo "手动解压: $zipfile"
+          temp_dir="${zipfile%.zip}_temp_$$"
+          mkdir -p "$temp_dir"
+          unzip -o "$zipfile" -d "$temp_dir"
+          
+          items=("$temp_dir"/*)
+          if [ ${#items[@]} -eq 1 ] && [ -d "${items[0]}" ]; then
+            subdir="${items[0]}"
+            echo "检测到顶层子目录: $subdir，将其内容移动到根目录"
+            cp -r "$subdir"/. .
+            rm -rf "$subdir"
+          else
+            echo "ZIP 内没有单一顶层目录，直接移动所有内容"
+            cp -r "$temp_dir"/. .
+          fi
+          
+          rm -rf "$temp_dir"
+          rm -f "$zipfile"
+          echo "✅ 解压并移动完成"
+
+      - name: 移动手动指定的子目录到根目录
+        if: github.event_name == 'workflow_dispatch' && inputs.subdir != ''
+        run: |
+          shopt -s dotglob
+          SUBDIR="${{ inputs.subdir }}"
+          if [ ! -d "$SUBDIR" ]; then
+            echo "错误：子目录 '$SUBDIR' 不存在"
+            echo "当前目录下的子目录："
+            ls -d */ 2>/dev/null || echo "（无）"
+            exit 1
+          fi
+          echo "移动子目录 '$SUBDIR' 的内容到根目录"
+          cp -r "$SUBDIR"/. .
+          rm -rf "$SUBDIR"
+          echo "✅ 子目录已提升到根目录"
+
+      - name: 提交更改
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "自动解压 ZIP 并整理目录结构"
+          git push
