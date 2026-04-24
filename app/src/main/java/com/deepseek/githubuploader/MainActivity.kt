@@ -2,14 +2,12 @@ package com.deepseek.githubuploader
 
 import android.content.ContentValues
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -27,14 +25,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import com.google.gson.GsonBuilder
 import com.google.gson.annotations.SerializedName
@@ -49,7 +45,6 @@ import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.*
 import java.io.File
 import java.io.FileOutputStream
-import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -100,7 +95,6 @@ interface GithubApi {
         @Query("sort") sort: String = "updated"
     ): Response<List<Repo>>
 
-    // 新增：下载仓库 ZIP
     @GET("repos/{owner}/{repo}/zipball/{ref}")
     suspend fun downloadRepoArchive(
         @Path("owner") owner: String,
@@ -216,7 +210,7 @@ class MainActivity : ComponentActivity() {
 }
 
 // ==================== 主界面 ====================
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun UploadScreen(api: GithubApi, context: MainActivity) {
     var createNewRepo by remember { mutableStateOf(false) }
@@ -244,21 +238,72 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
     var userInfo by remember { mutableStateOf<GithubApi.UserInfo?>(null) }
     var repoContents by remember { mutableStateOf<List<GithubApi.RepoContentItem>?>(null) }
     var isLoadingInfo by remember { mutableStateOf(false) }
-    // 仓库列表相关
     var userRepos by remember { mutableStateOf<List<GithubApi.Repo>>(emptyList()) }
     var isLoadingRepos by remember { mutableStateOf(false) }
-    // 快速选择下拉框专用变量
     var quickSearchText by remember { mutableStateOf("") }
     var quickSelectExpanded by remember { mutableStateOf(false) }
-    // 下载历史记录
     var downloadHistory by remember { mutableStateOf<List<DownloadHistoryItem>>(emptyList()) }
-    // 选中的文件/文件夹（用于右键菜单）
     var selectedContentItem by remember { mutableStateOf<GithubApi.RepoContentItem?>(null) }
     var showContextMenu by remember { mutableStateOf(false) }
-    var contextMenuPosition by remember { mutableStateOf(Pair(0f, 0f)) }
 
     val listState = rememberLazyListState()
     val prefs = context.getSharedPreferences("github_uploader", Context.MODE_PRIVATE)
+
+    // 保存文件到 Downloads 目录的辅助函数
+    fun saveFileToDownloads(fileName: String, data: ByteArray): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, getMimeType(fileName))
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val resolver = context.contentResolver
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                uri?.let {
+                    resolver.openOutputStream(it)?.use { outputStream ->
+                        outputStream.write(data)
+                    }
+                    values.clear()
+                    values.put(MediaStore.Downloads.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                    true
+                } ?: false
+            } else {
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val file = File(downloadsDir, fileName)
+                FileOutputStream(file).use { it.write(data) }
+                true
+            }
+        } catch (e: Exception) {
+            addLog("⚠ 保存文件异常: ${e.message}")
+            false
+        }
+    }
+
+    // 获取 MIME 类型的辅助函数
+    fun getMimeType(fileName: String): String {
+        return when (fileName.substringAfterLast('.', "").lowercase()) {
+            "zip" -> "application/zip"
+            "yml", "yaml" -> "text/yaml"
+            "txt" -> "text/plain"
+            "json" -> "application/json"
+            "md" -> "text/markdown"
+            "html" -> "text/html"
+            "css" -> "text/css"
+            "js" -> "application/javascript"
+            "kt" -> "text/plain"
+            "java" -> "text/plain"
+            "xml" -> "application/xml"
+            "png", "jpg", "jpeg", "gif" -> "image/*"
+            else -> "application/octet-stream"
+        }
+    }
+
+    fun addLog(msg: String) {
+        val timestamp = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        logs = logs + "[$timestamp] $msg"
+    }
 
     fun loadRepoHistory() {
         val historySet = prefs.getStringSet("repo_history", emptySet()) ?: emptySet()
@@ -290,7 +335,7 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
             downloadTime = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date()),
             size = size
         )
-        val newHistory = listOf(newItem) + downloadHistory.take(19) // 保留最近20条
+        val newHistory = listOf(newItem) + downloadHistory.take(19)
         saveDownloadHistory(newHistory)
     }
 
@@ -301,11 +346,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
         if (set.size > 10) set.drop(set.size - 10)
         prefs.edit().putStringSet("repo_history", set).apply()
         loadRepoHistory()
-    }
-
-    fun addLog(msg: String) {
-        val timestamp = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-        logs = logs + "[$timestamp] $msg"
     }
 
     suspend fun loadUserRepos() {
@@ -434,20 +474,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
             repoContents = null
             return
         }
-        if (createNewRepo) {
-            if (repoUrl.isNotBlank()) {
-                val parsed = parseRepo(repoUrl) ?: run { repoContents = null; return }
-                isLoadingInfo = true
-                try {
-                    val resp = api.getRepoContents(parsed.first, parsed.second, "", branch, "token $cleanToken")
-                    repoContents = if (resp.isSuccessful) resp.body() else null
-                } catch (e: Exception) { repoContents = null }
-                isLoadingInfo = false
-            } else {
-                repoContents = null
-            }
-            return
-        }
         val parsed = parseRepo(repoUrl) ?: run { repoContents = null; return }
         isLoadingInfo = true
         try {
@@ -456,8 +482,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
         } catch (e: Exception) { repoContents = null }
         isLoadingInfo = false
     }
-
-    // ==================== 新增：下载功能 ====================
 
     // 下载单个文件
     fun downloadSingleFile(item: GithubApi.RepoContentItem) {
@@ -547,58 +571,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
         }
     }
 
-    // 保存文件到 Downloads 目录
-    private fun saveFileToDownloads(fileName: String, data: ByteArray): Boolean {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                    put(MediaStore.Downloads.MIME_TYPE, getMimeType(fileName))
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                uri?.let {
-                    resolver.openOutputStream(it)?.use { outputStream ->
-                        outputStream.write(data)
-                    }
-                    values.clear()
-                    values.put(MediaStore.Downloads.IS_PENDING, 0)
-                    resolver.update(uri, values, null, null)
-                    true
-                } ?: false
-            } else {
-                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                val file = File(downloadsDir, fileName)
-                FileOutputStream(file).use { it.write(data) }
-                true
-            }
-        } catch (e: Exception) {
-            addLog("⚠ 保存文件异常: ${e.message}")
-            false
-        }
-    }
-
-    // 获取 MIME 类型
-    private fun getMimeType(fileName: String): String {
-        return when (fileName.substringAfterLast('.', "").lowercase()) {
-            "zip" -> "application/zip"
-            "yml", "yaml" -> "text/yaml"
-            "txt" -> "text/plain"
-            "json" -> "application/json"
-            "md" -> "text/markdown"
-            "html" -> "text/html"
-            "css" -> "text/css"
-            "js" -> "application/javascript"
-            "kt" -> "text/plain"
-            "java" -> "text/plain"
-            "xml" -> "application/xml"
-            "png", "jpg", "jpeg", "gif" -> "image/*"
-            else -> "application/octet-stream"
-        }
-    }
-
-    // ==================== 上传功能 ====================
     fun startUpload() {
         if (isUploading) return
         val cleanToken = token.trim()
@@ -692,8 +664,7 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
     LaunchedEffect(repoUrl, createNewRepo, branch, token) {
         if (token.isNotBlank()) {
             loadUserInfo()
-            if (!createNewRepo && repoUrl.isNotBlank()) loadRepoContents()
-            else if (createNewRepo && repoUrl.isNotBlank()) loadRepoContents()
+            if (repoUrl.isNotBlank()) loadRepoContents()
         }
     }
     LaunchedEffect(token) {
@@ -709,7 +680,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
             colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            // 仓库类型选择
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) { RadioButton(!createNewRepo, { createNewRepo = false; savePrefs() }); Text("现有仓库") }
                 Row(verticalAlignment = Alignment.CenterVertically) { RadioButton(createNewRepo, { createNewRepo = true; savePrefs() }); Text("新仓库") }
@@ -718,13 +688,11 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
             if (createNewRepo) {
                 OutlinedTextField(newRepoName, { newRepoName = it; savePrefs() }, label = { Text("仓库名称") }, placeholder = { Text("例如: my-new-repo") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             } else {
-                // 可手动编辑的仓库地址输入框
                 OutlinedTextField(
                     value = repoUrl,
                     onValueChange = {
                         repoUrl = it
                         savePrefs()
-                        // 手动编辑时清空快速搜索框内容
                         quickSearchText = ""
                     },
                     label = { Text("仓库地址") },
@@ -734,7 +702,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                // 独立的快速选择下拉框
                 ExposedDropdownMenuBox(
                     expanded = quickSelectExpanded,
                     onExpandedChange = { quickSelectExpanded = it }
@@ -775,7 +742,7 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                                     onClick = {
                                         repoUrl = repo.html_url
                                         savePrefs()
-                                        quickSearchText = ""   // 清空搜索框
+                                        quickSearchText = ""
                                         quickSelectExpanded = false
                                         if (selectedInfoTab == 2) context.lifecycleScope.launch { loadRepoContents() }
                                     }
@@ -789,7 +756,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
 
             Divider()
 
-            // 文件选择按钮
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 Button(onClick = { filePickerLauncher.launch("*/*") }, modifier = Modifier.weight(1f)) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(4.dp)); Text("选择文件") }
             }
@@ -828,7 +794,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                 }
             }
 
-            // 上传按钮
             Button(onClick = { startUpload() }, enabled = !isUploading, modifier = Modifier.fillMaxWidth().height(56.dp), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)) {
                 if (isUploading) {
                     CircularProgressIndicator(Modifier.size(24.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 2.dp)
@@ -841,7 +806,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                 }
             }
 
-            // 三标签信息窗口
             TabRow(selectedTabIndex = selectedInfoTab) {
                 Tab(selected = selectedInfoTab == 0, onClick = { selectedInfoTab = 0 }) { Text("日志", Modifier.padding(12.dp)) }
                 Tab(selected = selectedInfoTab == 1, onClick = { selectedInfoTab = 1 }) { Text("信息", Modifier.padding(12.dp)) }
@@ -882,12 +846,11 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                         if (createNewRepo) item { Text("新仓库: $newRepoName") }
                         else if (repoUrl.isNotBlank()) {
                             val p = parseRepo(repoUrl)
-                            if (p != null) { item { Text("仓库: ${p.first}/${p.second}") }; item { Text("分支: $branch}") } }
+                            if (p != null) { item { Text("仓库: ${p.first}/${p.second}") }; item { Text("分支: $branch") } }
                             else item { Text("仓库地址格式错误", color = ErrorRed) }
                         } else item { Text("未选择仓库") }
                     }
                     2 -> Column(Modifier.fillMaxSize()) {
-                        // 下载工具栏
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.padding(12.dp).fillMaxWidth()
@@ -918,7 +881,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
 
                         Divider()
 
-                        // 文件列表（支持长按下载）
                         if (isLoadingInfo) {
                             Box(Modifier.fillMaxSize().padding(16.dp), Alignment.Center) {
                                 Row { CircularProgressIndicator(Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text("加载仓库内容...") }
@@ -986,7 +948,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                 }
             }
 
-            // 设置对话框
             if (showSettingsDialog) AlertDialog(
                 onDismissRequest = { showSettingsDialog = false },
                 title = { Text("设置") },
@@ -1039,7 +1000,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                 confirmButton = { Button(onClick = { showSettingsDialog = false }) { Text("确定") } }
             )
 
-            // 下载历史对话框
             if (showDownloadHistoryDialog) AlertDialog(
                 onDismissRequest = { showDownloadHistoryDialog = false },
                 title = { Text("下载历史记录") },
@@ -1070,7 +1030,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                 }
             )
 
-            // 右键菜单（长按文件项）
             if (showContextMenu && selectedContentItem != null) {
                 AlertDialog(
                     onDismissRequest = { showContextMenu = false; selectedContentItem = null },
